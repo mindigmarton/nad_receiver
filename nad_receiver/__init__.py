@@ -8,10 +8,12 @@ Functions can be found on the NAD website: http://nadelectronics.com/software
 import codecs
 import socket
 from time import sleep
-from nad_receiver.nad_commands import CMDS
-import serial  # pylint: disable=import-error
+import nad_receiver.nad_commands as nad_commands
 import threading
-import telnetlib
+import asyncio
+import logging
+
+_LOGGER = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = 1
 DEFAULT_WRITE_TIMEOUT = 1
@@ -23,6 +25,8 @@ class NADReceiver(object):
     def __init__(self, serial_port, timeout=DEFAULT_TIMEOUT,
                  write_timeout=DEFAULT_WRITE_TIMEOUT):
         """Create RS232 connection."""
+        import serial  # pylint: disable=import-error
+
         self.ser = serial.Serial(serial_port, baudrate=115200, timeout=timeout,
                                  write_timeout=write_timeout)
         self.lock = threading.Lock()
@@ -33,15 +37,16 @@ class NADReceiver(object):
 
         The receiver will always return a value, also when setting a value.
         """
-        if operator in CMDS[domain][function]['supported_operators']:
+        if operator in nad_commands.CMDS[domain][function]['supported_operators']:
             if operator is '=' and value is None:
                 raise ValueError('No value provided')
 
             if value is None:
-                cmd = ''.join([CMDS[domain][function]['cmd'], operator])
+                cmd = ''.join([nad_commands.CMDS[domain]
+                               [function]['cmd'], operator])
             else:
                 cmd = ''.join(
-                    [CMDS[domain][function]['cmd'], operator, str(value)])
+                    [nad_commands.CMDS[domain][function]['cmd'], operator, str(value)])
         else:
             raise ValueError('Invalid operator provided %s' % operator)
 
@@ -158,55 +163,37 @@ class NADReceiverTCP(object):
                         SOURCES.items()}
 
     PORT = 50001
-    BUFFERSIZE = 1024
 
-    def __init__(self, host):
+    def __init__(self, host, loop):
         """Setup globals."""
         self._host = host
+        self._loop = loop
 
-    def _send(self, message, read_reply=False):
+    async def _send(self, message, read_reply=False):
         """Send a command string to the amplifier."""
-        sock = None
-        for tries in range(0, 3):
-            try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.connect((self._host, self.PORT))
-                break
-            except (ConnectionError, BrokenPipeError):
-                if tries == 3:
-                    print("socket connect failed.")
-                    return
-                sleep(0.1)
-        sock.send(codecs.decode(message, 'hex_codec'))
-        if read_reply:
-            sleep(0.1)
-            reply = ''
-            tries = 0
-            max_tries = 20
-            while len(reply) < len(message) and tries < max_tries:
-                try:
-                    reply += codecs.encode(sock.recv(self.BUFFERSIZE), 'hex')\
-                        .decode("utf-8")
-                except (ConnectionError, BrokenPipeError):
-                    pass
-                tries += 1
-            sock.close()
-            if tries >= max_tries:
-                return
-            return reply
-        sock.close()
+        reader, writer = await asyncio.open_connection(self._host, self.PORT,
+                                                       loop=self._loop)
+        try:
+            writer.write(codecs.decode(message, 'hex_codec'))
+            if read_reply:
+                reply = ''
+                while len(reply) < len(message):
+                    reply = await asyncio.wait_for(reader.readline(), timeout=10.0)
+                return reply.decode('utf-8')
+        finally:
+            writer.close()
 
-    def status(self):
+    async def status(self):
         """
         Return the status of the device.
 
-        Returns a dictionary with keys 'volume' (int 0-200) , 'power' (bool),
-         'muted' (bool) and 'source' (str).
+        Returns a dictionary with keys 'Main.Volume' (int 0-200) , 'Main.Power' (bool),
+         'Main.Mute' (bool) and 'Main.Source' (str).
         """
-        nad_reply = self._send(self.POLL_VOLUME +
-                               self.POLL_POWER +
-                               self.POLL_MUTED +
-                               self.POLL_SOURCE, read_reply=True)
+        nad_reply = await self._send(self.POLL_VOLUME +
+                                     self.POLL_POWER +
+                                     self.POLL_MUTED +
+                                     self.POLL_SOURCE, read_reply=True)
         if nad_reply is None:
             return
 
@@ -215,49 +202,256 @@ class NADReceiverTCP(object):
         nad_status = [nad_reply[i:i + num_chars]
                       for i in range(0, len(nad_reply), num_chars)]
 
-        return {'volume': int(nad_status[0][-2:], 16),
-                'power': nad_status[1][-2:] == '01',
-                'muted': nad_status[2][-2:] == '01',
-                'source': self.SOURCES_REVERSED[nad_status[3][-2:]]}
+        return {'Main.Volume': int(nad_status[0][-2:], 16),
+                'Main.Power': nad_status[1][-2:] == '01',
+                'Main.Mute': nad_status[2][-2:] == '01',
+                'Main.Source': self.SOURCES_REVERSED[nad_status[3][-2:]]}
 
-    def power_off(self):
+    async def power_off(self):
         """Power the device off."""
         status = self.status()
         if status['power']:  # Setting power off when it is already off can cause hangs
-            self._send(self.CMD_POWERSAVE + self.CMD_OFF)
+            await self._send(self.CMD_POWERSAVE + self.CMD_OFF)
 
-    def power_on(self):
+    async def power_on(self):
         """Power the device on."""
         status = self.status()
         if not status['power']:
-            self._send(self.CMD_ON, read_reply=True)
-            sleep(0.5)  # Give NAD7050 some time before next command
+            await self._send(self.CMD_ON, read_reply=True)
 
-    def set_volume(self, volume):
+    async def set_volume(self, volume):
         """Set volume level of the device. Accepts integer values 0-200."""
         if 0 <= volume <= 200:
             volume = format(volume, "02x")  # Convert to hex
-            self._send(self.CMD_VOLUME + volume)
+            await self._send(self.CMD_VOLUME + volume)
 
-    def mute(self):
+    async def mute(self):
         """Mute the device."""
-        self._send(self.CMD_MUTE, read_reply=True)
+        await self._send(self.CMD_MUTE, read_reply=True)
 
-    def unmute(self):
+    async def unmute(self):
         """Unmute the device."""
-        self._send(self.CMD_UNMUTE)
+        await self._send(self.CMD_UNMUTE)
 
-    def select_source(self, source):
+    async def select_source(self, source):
         """Select a source from the list of sources."""
         status = self.status()
         if status['power']:  # Changing source when off may hang NAD7050
-            if status['source'] != source:  # Setting the source to the current source will hang the NAD7050
+            # Setting the source to the current source will hang the NAD7050
+            if status['source'] != source:
                 if source in self.SOURCES:
-                    self._send(self.CMD_SOURCE + self.SOURCES[source], read_reply=True)
+                    await self._send(self.CMD_SOURCE + self.SOURCES[source], read_reply=True)
 
     def available_sources(self):
         """Return a list of available sources."""
         return list(self.SOURCES.keys())
+
+
+class NADReceiverTCPC338(object):
+    """
+    Support NAD amplifiers that use tcp for communication.
+
+    Known supported model: Nad D C338.
+    """
+
+    PORT = 30001
+
+    def __init__(self, host, loop,
+                 reconnect_timeout=10,
+                 state_changed_timeout=0.1,
+                 state_changed_cb=None):
+        self._host = host
+        self._loop = loop
+
+        self._reconnect_timeout = reconnect_timeout
+        self._state_changed_timeout = state_changed_timeout
+        self._state_changed_cb = state_changed_cb
+
+        self._reader = None
+        self._writer = None
+
+        self._connection_task = None
+        self._state_changed_waiter = None
+        self._state_changed_task = None
+
+        self._state = {}
+
+    async def _state_changed(self):
+        await asyncio.sleep(self._state_changed_timeout)
+
+        if self._state_changed_cb:
+            self._state_changed_cb(self._state)
+
+        if self._state_changed_waiter:
+            self._state_changed_waiter.set_result(True)
+
+    def _parse_data(self, data):
+        _LOGGER.debug("Received data %s", data)
+
+        key, value = data.split('=')
+        cmd_desc = nad_commands.C338_CMDS[key]
+
+        # convert the data to the correct type
+        if 'type' in cmd_desc:
+            if cmd_desc['type'] == bool:
+                value = bool(cmd_desc['values'].index(value))
+            else:
+                value = cmd_desc['type'](value)
+
+        self._state[key] = value
+
+        # volume changes implicitly disables mute
+        if key == 'Main.Volume':
+            self._state['Main.Mute'] = False
+
+        if self._state_changed_task is None or self._state_changed_task.done():
+            self._state_changed_task = self._loop.create_task(self._state_changed())
+
+    async def _connection_loop(self):
+        try:
+            self._reader, self._writer = await asyncio.open_connection(self._host, self.PORT, loop=self._loop)
+
+            # get state after connecting
+            await self.exec_command('Main', '?')
+
+            # read until EOF
+            while self._reader and not self._reader.at_eof():
+                data = await self._reader.readline()
+                if data:
+                    self._parse_data(data.decode('utf-8').strip())
+        finally:
+            # clean up
+            if self._state_changed_waiter:
+                self._state_changed_waiter.cancel()
+
+            if self._state_changed_task:
+                self._state_changed_task.cancel()
+
+            self._writer = None
+            self._reader = None
+
+            if self._state:
+                self._state.clear()
+
+                if self._state_changed_cb:
+                    self._state_changed_cb(self._state)
+
+    async def disconnect(self):
+        """Disconnect from the device."""
+        _LOGGER.debug("Disconnecting from %s", self._host)
+
+        if self._writer:
+            # send EOF, let the connection exit gracefully
+            if self._writer.can_write_eof():
+                _LOGGER.debug("Disconnect: writing EOF")
+                self._writer.write_eof()
+            # socket cannot send EOF, cancel connection
+            elif self._connection_task:
+                _LOGGER.debug("Disconnect: force")
+                self._connection_task.cancel()
+
+            await self._connection_task
+
+    async def run_loop(self):
+        """Start the connection loop which handles reconnects."""
+        while True:
+            _LOGGER.debug("Connecting to %s", self._host)
+            self._connection_task = self._loop.create_task(self._connection_loop())
+            try:
+                await self._connection_task
+                # EOF reached, break reconnect loop
+                _LOGGER.debug("EOF reached")
+                break
+            except asyncio.CancelledError:
+                # force disconnect, break reconnect loop
+                _LOGGER.debug("Force disconnect")
+                break
+            except (ConnectionRefusedError, OSError, asyncio.TimeoutError) as e:
+                _LOGGER.exception("Disconnected, reconnecting in %ss",
+                                  self._reconnect_timeout, exc_info=e)
+                await asyncio.sleep(self._reconnect_timeout)
+
+    async def exec_command(self, command, operator, value=None):
+        """Execute a command on the device."""
+        if self._writer:
+            cmd_desc = nad_commands.C338_CMDS[command]
+            # validate operator
+            if operator in cmd_desc['supported_operators']:
+                if operator is '=' and value is None:
+                    raise ValueError("No value provided")
+                elif operator in ['?', '-', '+'] and value is not None:
+                    raise ValueError(
+                        "Operator \'%s\' cannot be called with a value" % operator)
+
+                if value is None:
+                    cmd = command + operator
+                else:
+                    # validate value
+                    if 'values' in cmd_desc:
+                        if 'type' in cmd_desc and cmd_desc['type'] == bool:
+                            value = cmd_desc['values'][int(value)]
+                        elif value not in cmd_desc['values']:
+                            raise ValueError("Given value \'%s\' is not one of %s" % (
+                                value, cmd_desc['values']))
+
+                    cmd = command + operator + str(value)
+            else:
+                raise ValueError("Invalid operator provided %s" % operator)
+
+            self._writer.write(cmd.encode('utf-8'))
+
+    async def status(self):
+        """
+        Return the status of the device.
+
+        Returns a dictionary with keys 'Main.Volume' (int -80-0) , 'Main.Power' (bool),
+         'Main.Mute' (bool) and 'Main.Source' (str).
+        """
+        if self._state_changed_waiter is None or self._state_changed_waiter.done():
+            self._state_changed_waiter = self._loop.create_future()
+
+        await self.exec_command('Main', '?')
+
+        # not guaranteed to get the correct response, so just wait until the next state change
+        await self._state_changed_waiter
+
+        return self._state
+
+    async def power_off(self):
+        """Power the device off."""
+        await self.exec_command(nad_commands.CMD_POWER, '=', False)
+
+    async def power_on(self):
+        """Power the device on."""
+        await self.exec_command(nad_commands.CMD_POWER, '=', True)
+
+    async def set_volume(self, volume):
+        """Set volume level of the device in dBa. Accepts integer values -80-0."""
+        await self.exec_command(nad_commands.CMD_VOLUME, '=', float(volume))
+
+    async def volume_down(self):
+        """Decrease the volume of the device."""
+        await self.exec_command(nad_commands.CMD_VOLUME, '-')
+
+    async def volume_up(self):
+        """Increase the volume of the device."""
+        await self.exec_command(nad_commands.CMD_VOLUME, '+')
+
+    async def mute(self):
+        """Mute the device."""
+        await self.exec_command(nad_commands.CMD_MUTE, '=', True)
+
+    async def unmute(self):
+        """Unmute the device."""
+        await self.exec_command(nad_commands.CMD_MUTE, '=', False)
+
+    async def select_source(self, source):
+        """Select a source from the list of sources."""
+        await self.exec_command(nad_commands.CMD_SOURCE, '=', source)
+
+    def available_sources(self):
+        """Return a list of available sources."""
+        return list(nad_commands.C338_CMDS[nad_commands.CMD_SOURCE]['values'])
 
 
 class NADReceiverTelnet(NADReceiver):
@@ -267,7 +461,10 @@ class NADReceiverTelnet(NADReceiver):
 
     Known supported model: Nad T787.
     """
+
     def _open_connection(self):
+        import telnetlib
+
         if not self.telnet:
             try:
                 self.telnet = telnetlib.Telnet(self.host, self.port, 3)
@@ -305,15 +502,16 @@ class NADReceiverTelnet(NADReceiver):
         """
         Write a command to the receiver and read the value it returns.
         """
-        if operator in CMDS[domain][function]['supported_operators']:
+        if operator in nad_commands.CMDS[domain][function]['supported_operators']:
             if operator is '=' and value is None:
                 raise ValueError('No value provided')
 
             if value is None:
-                cmd = ''.join([CMDS[domain][function]['cmd'], operator])
+                cmd = ''.join([nad_commands.CMDS[domain]
+                               [function]['cmd'], operator])
             else:
                 cmd = ''.join(
-                    [CMDS[domain][function]['cmd'], operator, str(value)])
+                    [nad_commands.CMDS[domain][function]['cmd'], operator, str(value)])
         else:
             raise ValueError('Invalid operator provided %s' % operator)
 
@@ -338,7 +536,7 @@ class NADReceiverTelnet(NADReceiver):
                 msg = msg.decode().strip('\r\n')
                 # Could raise eg. UnicodeError, let the client handle it
 
-                #print("NAD reponded with '%s'" % msg)
+                # print("NAD reponded with '%s'" % msg)
                 # Wait for the response that equals the requested domain.function
                 if msg.strip().split('=')[0].lower() == '.'.join([domain, function]).lower():
                     # b'Main.Volume=-12\r will return -12
