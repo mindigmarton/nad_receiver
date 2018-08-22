@@ -271,7 +271,6 @@ class NADReceiverTCPC338(object):
         self._writer = None
 
         self._connection_task = None
-        self._state_changed_waiter = None
         self._state_changed_task = None
 
         self._state = {}
@@ -282,11 +281,10 @@ class NADReceiverTCPC338(object):
         if self._state_changed_cb:
             self._state_changed_cb(self._state)
 
-        if self._state_changed_waiter:
-            self._state_changed_waiter.set_result(True)
-
     def _parse_data(self, data):
         _LOGGER.debug("Received data %s", data)
+
+        data = data.decode('utf-8').replace('\x00', '').strip()
 
         key, value = data.split('=')
         cmd_desc = nad_commands.C338_CMDS[key]
@@ -312,18 +310,15 @@ class NADReceiverTCPC338(object):
             self._reader, self._writer = await asyncio.open_connection(self._host, self.PORT, loop=self._loop)
 
             # get state after connecting
-            await self.exec_command('Main', '?')
+            self.exec_command('Main', '?')
 
             # read until EOF
             while self._reader and not self._reader.at_eof():
                 data = await self._reader.readline()
                 if data:
-                    self._parse_data(data.decode('utf-8').strip())
+                    self._parse_data(data)
         finally:
             # clean up
-            if self._state_changed_waiter:
-                self._state_changed_waiter.cancel()
-
             if self._state_changed_task:
                 self._state_changed_task.cancel()
 
@@ -371,7 +366,7 @@ class NADReceiverTCPC338(object):
                                   self._reconnect_timeout, exc_info=e)
                 await asyncio.sleep(self._reconnect_timeout)
 
-    async def exec_command(self, command, operator, value=None):
+    def exec_command(self, command, operator, value=None):
         """Execute a command on the device."""
         if self._writer:
             cmd_desc = nad_commands.C338_CMDS[command]
@@ -407,47 +402,39 @@ class NADReceiverTCPC338(object):
         Returns a dictionary with keys 'Main.Volume' (int -80-0) , 'Main.Power' (bool),
          'Main.Mute' (bool) and 'Main.Source' (str).
         """
-        if self._state_changed_waiter is None or self._state_changed_waiter.done():
-            self._state_changed_waiter = self._loop.create_future()
-
-        await self.exec_command('Main', '?')
-
-        # not guaranteed to get the correct response, so just wait until the next state change
-        await self._state_changed_waiter
-
         return self._state
 
     async def power_off(self):
         """Power the device off."""
-        await self.exec_command(nad_commands.CMD_POWER, '=', False)
+        self.exec_command(nad_commands.CMD_POWER, '=', False)
 
     async def power_on(self):
         """Power the device on."""
-        await self.exec_command(nad_commands.CMD_POWER, '=', True)
+        self.exec_command(nad_commands.CMD_POWER, '=', True)
 
     async def set_volume(self, volume):
         """Set volume level of the device in dBa. Accepts integer values -80-0."""
-        await self.exec_command(nad_commands.CMD_VOLUME, '=', float(volume))
+        self.exec_command(nad_commands.CMD_VOLUME, '=', float(volume))
 
     async def volume_down(self):
         """Decrease the volume of the device."""
-        await self.exec_command(nad_commands.CMD_VOLUME, '-')
+        self.exec_command(nad_commands.CMD_VOLUME, '-')
 
     async def volume_up(self):
         """Increase the volume of the device."""
-        await self.exec_command(nad_commands.CMD_VOLUME, '+')
+        self.exec_command(nad_commands.CMD_VOLUME, '+')
 
     async def mute(self):
         """Mute the device."""
-        await self.exec_command(nad_commands.CMD_MUTE, '=', True)
+        self.exec_command(nad_commands.CMD_MUTE, '=', True)
 
     async def unmute(self):
         """Unmute the device."""
-        await self.exec_command(nad_commands.CMD_MUTE, '=', False)
+        self.exec_command(nad_commands.CMD_MUTE, '=', False)
 
     async def select_source(self, source):
         """Select a source from the list of sources."""
-        await self.exec_command(nad_commands.CMD_SOURCE, '=', source)
+        self.exec_command(nad_commands.CMD_SOURCE, '=', source)
 
     def available_sources(self):
         """Return a list of available sources."""
